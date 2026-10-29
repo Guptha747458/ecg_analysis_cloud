@@ -1,518 +1,250 @@
+"""Cloud ECG Analysis System - Streamlit application."""
+
+from __future__ import annotations
 
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
-import joblib
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-import wfdb
 
-from scipy.optimize import linear_sum_assignment
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-    ConfusionMatrixDisplay
-)
+from ecg_analysis import analyze_ecg, read_ecg_csv
+from pdf_report import create_pdf_report
 
-from ecg_utils import filter_ecg, prepare_beat, detect_r_peaks
-
-ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "ecg_model.joblib"
-
-LABEL_MAP = {
-    "N": "N", "L": "N", "R": "N", "e": "N", "j": "N",
-    "A": "S", "a": "S", "J": "S", "S": "S",
-    "V": "V", "E": "V", "F": "F"
-}
-CLASSES = ["N", "S", "V", "F"]
 
 st.set_page_config(
-    page_title="ECG Analysis in the Cloud",
-    page_icon="❤️",
-    layout="wide"
+    page_title="Cloud ECG Analysis System",
+    page_icon="♥",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-
-@st.cache_resource
-def load_model():
-    return joblib.load(MODEL_PATH)
+ROOT = Path(__file__).resolve().parent
 
 
-def match_peaks(reference, detected, tolerance):
-    """One-to-one matching of reference and detected peak samples."""
-    reference = np.asarray(reference, dtype=int)
-    detected = np.asarray(detected, dtype=int)
-
-    if len(reference) == 0 or len(detected) == 0:
-        return [], len(reference), len(detected)
-
-    # Only create candidate matches within the tolerance.
-    distances = np.abs(reference[:, None] - detected[None, :])
-    ref_idx, det_idx = linear_sum_assignment(distances)
-
-    matches = [
-        (int(reference[i]), int(detected[j]))
-        for i, j in zip(ref_idx, det_idx)
-        if distances[i, j] <= tolerance
-    ]
-
-    tp = len(matches)
-    return matches, len(reference) - tp, len(detected) - tp
-
-
-st.title("❤️ Healthcare: ECG Analysis in the Cloud")
-st.write(
-    "Upload ECG recordings to visualize signals, estimate heart rate, "
-    "classify candidate beats and compare predictions with annotations."
-)
-st.info(
-    "Educational research prototype only. Not intended for medical "
-    "diagnosis or treatment decisions."
-)
-
-with st.sidebar:
-    st.header("Analysis Settings")
-
-    fs_input = st.number_input(
-        "Sampling rate for CSV/TXT/NumPy (Hz)",
-        min_value=100, max_value=2000, value=360, step=1
+def apply_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container { max-width: 1200px; padding-top: 2rem; }
+        .hero { padding: 1.6rem 1.8rem; border-radius: 18px;
+                background: linear-gradient(135deg, #0b5563, #17807d);
+                color: white; margin-bottom: 1.5rem; }
+        .hero h1 { margin: 0; font-size: 2.2rem; }
+        .hero p { margin: .5rem 0 0; opacity: .9; }
+        .status-card { padding: 1.2rem; border-radius: 14px; color: white;
+                       margin: .7rem 0 1rem; }
+        .normal { background: #18866b; }
+        .abnormal { background: #c84b4b; }
+        .muted { color: #60717a; }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    polarity = st.selectbox(
-        "Expected R-peak polarity",
-        ["Positive", "Negative", "Absolute"]
-    )
 
-    display_seconds = st.slider(
-        "Waveform display duration (seconds)", 2, 20, 10
-    )
+def waveform_figure(result: dict[str, object], seconds: float) -> go.Figure:
+    signal = np.asarray(result["signal"], dtype=float)
+    sample_rate = float(result["sample_rate"])
+    limit = min(len(signal), max(1, int(seconds * sample_rate)))
+    step = max(1, limit // 5000)
+    values = signal[:limit:step]
+    time = np.arange(0, limit, step) / sample_rate
+    peaks = np.asarray(result["peaks"], dtype=int)
+    peaks = peaks[peaks < limit]
 
-    csv_has_header = st.checkbox(
-        "CSV/TXT contains a header row", value=False
-    )
-
-    st.caption(
-        "WFDB recordings use their header sampling rate. "
-        "For other formats, provide the correct sampling rate."
-    )
-
-uploaded_files = st.file_uploader(
-    "Upload ECG data",
-    type=["csv", "txt", "hea", "dat", "atr", "npy", "npz"],
-    accept_multiple_files=True,
-    help=(
-        "Upload one CSV/TXT/NPY/NPZ signal, or matching WFDB "
-        "files such as 219.hea, 219.dat and optional 219.atr."
-    )
-)
-
-if not uploaded_files:
-    st.markdown("### Supported formats")
-    st.write(
-        "CSV, TXT, NPY, NPZ and WFDB recordings (.hea + .dat; "
-        "optional .atr reference annotations)."
-    )
-    st.stop()
-
-try:
-    file_map = {Path(f.name).name: f for f in uploaded_files}
-    extensions = {Path(n).suffix.lower() for n in file_map}
-
-    signal = None
-    annotations = None
-    fs = int(fs_input)
-    signal_name = "ECG"
-    channel_names = []
-    record_name = None
-
-    # ---------------- WFDB ----------------
-    if ".hea" in extensions or ".dat" in extensions:
-        headers = [n for n in file_map if n.lower().endswith(".hea")]
-        if len(headers) != 1:
-            st.error("Upload exactly one .hea file and its matching .dat file.")
-            st.stop()
-
-        record_name = Path(headers[0]).stem
-        dat_name = record_name + ".dat"
-
-        if dat_name not in file_map:
-            st.error(f"Matching file {dat_name} was not uploaded.")
-            st.stop()
-
-        with TemporaryDirectory() as temp:
-            temp_path = Path(temp)
-
-            for name, uploaded in file_map.items():
-                if (
-                    Path(name).stem == record_name
-                    and Path(name).suffix.lower() in {".hea", ".dat", ".atr"}
-                ):
-                    (temp_path / name).write_bytes(uploaded.getvalue())
-
-            base = str(temp_path / record_name)
-            record = wfdb.rdrecord(base)
-            data = record.p_signal if record.p_signal is not None else record.d_signal
-            data = np.asarray(data)
-
-            if data.ndim == 1:
-                data = data.reshape(-1, 1)
-
-            fs = float(record.fs)
-            channel_names = list(record.sig_name or [
-                f"Channel {i + 1}" for i in range(data.shape[1])
-            ])
-
-            atr_name = record_name + ".atr"
-            if atr_name in file_map:
-                ann = wfdb.rdann(base, "atr")
-                annotations = {
-                    "samples": np.asarray(ann.sample, dtype=int),
-                    "symbols": list(ann.symbol)
-                }
-
-        channel = st.selectbox(
-            "Select ECG channel",
-            range(data.shape[1]),
-            format_func=lambda i: channel_names[i]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scattergl(
+            x=time,
+            y=values,
+            mode="lines",
+            name="ECG signal",
+            line={"color": "#087f8c", "width": 1.4},
         )
-        signal = data[:, channel].astype(float)
-        signal_name = channel_names[channel]
-
-        st.success(f"Loaded WFDB record {record_name} at {fs:g} Hz.")
-
-    # ---------------- CSV / TXT ----------------
-    elif extensions.intersection({".csv", ".txt"}):
-        candidates = [
-            f for f in uploaded_files
-            if Path(f.name).suffix.lower() in {".csv", ".txt"}
-        ]
-        if len(candidates) != 1:
-            st.error("Upload only one CSV/TXT signal at a time.")
-            st.stop()
-
-        uploaded = candidates[0]
-        ext = Path(uploaded.name).suffix.lower()
-
-        if ext == ".csv":
-            df = pd.read_csv(
-                uploaded, header=0 if csv_has_header else None
+    )
+    if len(peaks):
+        fig.add_trace(
+            go.Scatter(
+                x=peaks / sample_rate,
+                y=signal[peaks],
+                mode="markers",
+                name="Detected beats",
+                marker={"color": "#d64b4b", "size": 7},
             )
-        else:
-            df = pd.read_csv(
-                uploaded,
-                header=0 if csv_has_header else None,
-                sep=None,
-                engine="python"
-            )
-
-        numeric = [
-            col for col in df.columns
-            if pd.to_numeric(df[col], errors="coerce").notna().any()
-        ]
-        if not numeric:
-            st.error("No numeric ECG signal column found.")
-            st.stop()
-
-        col = st.selectbox(
-            "Select ECG signal column",
-            numeric,
-            format_func=lambda c: str(c) if csv_has_header else f"Column {int(c)+1}"
         )
-        signal = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
-        signal_name = str(col)
-
-    # ---------------- NumPy ----------------
-    elif extensions.intersection({".npy", ".npz"}):
-        candidates = [
-            f for f in uploaded_files
-            if Path(f.name).suffix.lower() in {".npy", ".npz"}
-        ]
-        if len(candidates) != 1:
-            st.error("Upload one NPY/NPZ file at a time.")
-            st.stop()
-
-        uploaded = candidates[0]
-        loaded = np.load(uploaded, allow_pickle=False)
-
-        if isinstance(loaded, np.lib.npyio.NpzFile):
-            with loaded as archive:
-                keys = list(archive.files)
-                if not keys:
-                    st.error("NPZ file contains no arrays.")
-                    st.stop()
-                key = st.selectbox("Select array", keys)
-                arr = np.asarray(archive[key])
-        else:
-            arr = np.asarray(loaded)
-
-        if arr.ndim == 1:
-            signal = arr.astype(float)
-        elif arr.ndim == 2:
-            channel = st.selectbox(
-                "Select signal channel", range(arr.shape[1])
-            )
-            signal = arr[:, channel].astype(float)
-        else:
-            st.error("Only 1D and 2D numeric arrays are supported.")
-            st.stop()
-
-        signal_name = uploaded.name
-
-    else:
-        st.error("Unsupported input format.")
-        st.stop()
-
-    signal = np.asarray(signal, dtype=float).squeeze()
-
-    if signal.ndim != 1 or len(signal) < fs:
-        st.error("Signal must be a 1D array with at least one second of samples.")
-        st.stop()
-
-    if not np.all(np.isfinite(signal)):
-        st.error("Signal contains invalid numeric values.")
-        st.stop()
-
-    with st.spinner("Filtering ECG and detecting candidate peaks..."):
-        filtered = filter_ecg(signal, fs)
-        peaks = detect_r_peaks(filtered, fs, polarity)
-
-    duration = len(filtered) / fs
-
-    st.subheader("ECG Recording Summary")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Duration", f"{duration:.2f} s")
-    c2.metric("Samples", f"{len(signal):,}")
-    c3.metric("Sampling rate", f"{fs:g} Hz")
-    c4.metric("Candidate peaks", f"{len(peaks):,}")
-
-    # ---------------- ECG plot ----------------
-    st.subheader("Original vs Filtered ECG")
-
-    shown = min(len(signal), int(display_seconds * fs))
-    visible = peaks[peaks < shown]
-    fig, ax = plt.subplots(figsize=(13, 4))
-    ax.plot(np.arange(shown) / fs, signal[:shown],
-            linewidth=0.7, label="Original")
-    ax.plot(np.arange(shown) / fs, filtered[:shown],
-            linewidth=0.9, label="Filtered")
-
-    if len(visible):
-        ax.scatter(visible / fs, filtered[visible],
-                   s=18, label="Detected peaks")
-
-    if annotations is not None:
-        ref_visible = annotations["samples"]
-        ref_visible = ref_visible[ref_visible < shown]
-        ax.scatter(
-            ref_visible / fs, filtered[ref_visible],
-            marker="x", s=35, label="Reference annotations"
-        )
-
-    ax.set_xlabel("Time (seconds)")
-    ax.set_ylabel("Amplitude")
-    ax.set_title(f"ECG Signal: {signal_name}")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
-
-    # ---------------- Heart rate ----------------
-    st.subheader("Heart Rate Estimation")
-    rr = np.diff(peaks) / fs
-    valid_rr = rr[(rr >= 0.30) & (rr <= 2.0)]
-
-    if len(valid_rr):
-        bpm = 60 / np.median(valid_rr)
-        c1, c2 = st.columns(2)
-        c1.metric("Estimated heart rate", f"{bpm:.1f} BPM")
-        c2.metric("Usable intervals", f"{len(valid_rr):,}")
-    else:
-        st.warning("No usable peak-to-peak intervals found.")
-
-    # ---------------- Reference peak comparison ----------------
-    if annotations is not None:
-        st.subheader("Reference Annotation Comparison")
-
-        ref_samples = annotations["samples"]
-        symbols = annotations["symbols"]
-
-        # Standard MIT-BIH beat symbols; excludes non-beat annotations.
-        beat_indices = [
-            i for i, symbol in enumerate(symbols)
-            if symbol in LABEL_MAP and 0 <= ref_samples[i] < len(signal)
-        ]
-        ref_beats = ref_samples[beat_indices]
-        ref_symbols = [symbols[i] for i in beat_indices]
-        tolerance = int(round(0.10 * fs))
-
-        matches, missed, extra = match_peaks(ref_beats, peaks, tolerance)
-
-        tp = len(matches)
-        precision = tp / (tp + extra) if tp + extra else 0.0
-        recall = tp / (tp + missed) if tp + missed else 0.0
-        f1 = (
-            2 * precision * recall / (precision + recall)
-            if precision + recall else 0.0
-        )
-
-        st.write(f"Reference beat annotations: {len(ref_beats):,}")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Matched peaks", f"{tp:,}")
-        m2.metric("Missed reference beats", f"{missed:,}")
-        m3.metric("Extra detected peaks", f"{extra:,}")
-        m4.metric("Peak F1-score", f"{f1:.3f}")
-
-        st.caption(
-            "One-to-one matching with a ±100 ms tolerance. "
-            "These are peak-detection metrics, not ML classification accuracy."
-        )
-
-    # ---------------- ML classification ----------------
-    st.subheader("Machine-Learning Beat Classification")
-
-    if not MODEL_PATH.exists():
-        st.error("Model missing. Run python train_model.py first.")
-        st.stop()
-
-    bundle = load_model()
-    model = bundle["model"]
-
-    # The model must have been retrained using the same prepare_beat version.
-    rows = []
-    progress = st.progress(0)
-
-    for i, peak in enumerate(peaks):
-        beat = prepare_beat(
-            filtered, int(peak), fs, bundle["beat_length"]
-        )
-
-        if beat is not None:
-            x = beat.reshape(1, -1)
-            prediction = str(model.predict(x)[0])
-            confidence = np.nan
-
-            if hasattr(model, "predict_proba"):
-                probabilities = model.predict_proba(x)[0]
-                confidence = float(np.max(probabilities))
-
-            rows.append({
-                "Sample": int(peak),
-                "Time (seconds)": round(peak / fs, 3),
-                "Predicted category": prediction,
-                "Model confidence": confidence
-            })
-
-        if i % 25 == 0 or i == len(peaks) - 1:
-            progress.progress((i + 1) / max(1, len(peaks)))
-
-    progress.empty()
-
-    if not rows:
-        st.warning("No complete heartbeat segments were available.")
-        st.stop()
-
-    results = pd.DataFrame(rows)
-
-    st.write("Predicted category counts")
-    st.bar_chart(results["Predicted category"].value_counts())
-
-    results["Model confidence"] = results["Model confidence"].map(
-        lambda x: round(x, 3) if pd.notna(x) else None
+    fig.update_layout(
+        height=430,
+        margin={"l": 20, "r": 20, "t": 35, "b": 20},
+        xaxis_title="Time (seconds)",
+        yaxis_title="Amplitude",
+        hovermode="x unified",
+        template="plotly_white",
     )
-    st.dataframe(
-        results.drop(columns=["Sample"]),
-        use_container_width=True
+    return fig
+
+
+def show_home() -> None:
+    st.markdown(
+        '<div class="hero"><h1>Cloud ECG Analysis System</h1>'
+        "<p>A lightweight, privacy-conscious ECG screening workspace.</p></div>",
+        unsafe_allow_html=True,
     )
-
-    st.download_button(
-        "Download analysis results",
-        data=results.drop(columns=["Sample"]).to_csv(index=False).encode("utf-8"),
-        file_name="ecg_analysis_results.csv",
-        mime="text/csv"
-    )
-
-    # ---------------- Actual vs predicted classification ----------------
-    if annotations is not None:
-        st.subheader("Reference vs ML Classification")
-
-        # Match each reference beat to its nearest detected peak one-to-one.
-        # Match the original sample indices to prediction rows.
-        peak_to_prediction = {
-            int(row["Sample"]): row["Predicted category"] for row in rows
-        }
-        ref_sample_to_label = {
-            int(sample): LABEL_MAP[symbol]
-            for sample, symbol in zip(ref_beats, ref_symbols)
-        }
-
-        if len(matches):
-            ref_label_list = []
-            pred_label_list = []
-
-            # Only evaluate matched beats for which a model prediction exists.
-            for ref_sample, detected_sample in matches:
-                if (
-                    ref_sample in ref_sample_to_label
-                    and detected_sample in peak_to_prediction
-                ):
-                    ref_label_list.append(ref_sample_to_label[ref_sample])
-                    pred_label_list.append(peak_to_prediction[detected_sample])
-
-            if ref_label_list:
-                st.caption(
-                    "Classification scores are calculated only on matched "
-                    "reference beats with available model predictions."
-                )
-                st.metric(
-                    "Matched-beat classification accuracy",
-                    f"{accuracy_score(ref_label_list, pred_label_list):.3f}"
-                )
-
-                st.text("Classification report")
-                report = classification_report(
-                    ref_label_list,
-                    pred_label_list,
-                    labels=CLASSES,
-                    output_dict=True,
-                    zero_division=0
-                )
-                st.dataframe(pd.DataFrame(report).transpose())
-
-                cm = confusion_matrix(
-                    ref_label_list,
-                    pred_label_list,
-                    labels=CLASSES
-                )
-                fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
-                ConfusionMatrixDisplay(
-                    confusion_matrix=cm,
-                    display_labels=CLASSES
-                ).plot(ax=ax_cm, colorbar=False)
-                ax_cm.set_title("Reference vs Predicted Classes")
-                fig_cm.tight_layout()
-                st.pyplot(fig_cm)
-                plt.close(fig_cm)
-            else:
-                st.warning(
-                    "No matched reference beats had usable model predictions."
-                )
-        else:
-            st.warning(
-                "No reference beats matched detected peaks within ±100 ms."
-            )
-
-except Exception as exc:
-    st.error(f"Analysis failed: {exc}")
+    st.subheader("Analyze an ECG in three steps")
+    columns = st.columns(3)
+    for column, title, text in zip(
+        columns,
+        ("1. Upload", "2. Analyze", "3. Report"),
+        (
+            "Upload a CSV containing one or more numeric ECG signal columns.",
+            "Explore an interactive waveform and run transparent signal checks.",
+            "Review the result and download a PDF summary.",
+        ),
+    ):
+        column.markdown(f"### {title}")
+        column.write(text)
     st.info(
-        "Check file formats, sampling rate, annotation files, and model compatibility."
+        "This educational screening tool is not a medical device and does not "
+        "provide a diagnosis. Consult a qualified clinician for medical advice."
+    )
+    st.subheader("Why cloud processing?")
+    st.write(
+        "Streamlit Cloud provides centralized hosting, remote access, and "
+        "on-demand processing without requiring local software installation. "
+        "Uploaded bytes are processed in memory and are not written to a "
+        "database or retained as personal information."
+    )
+    st.subheader("CSV instructions")
+    st.write(
+        "Use one numeric sample per row. A header is optional, and files may "
+        "contain multiple numeric columns; the signal column can be selected "
+        "after upload. The included sample_ecg.csv is ready to try."
     )
 
-st.divider()
-st.caption(
-    "Healthcare: ECG Analysis in the Cloud | "
-    "Educational prototype, not for clinical use."
-)
+
+def show_upload() -> None:
+    st.header("Upload ECG data")
+    uploaded = st.file_uploader(
+        "Choose an ECG CSV file",
+        type=["csv"],
+        help="CSV files must contain at least 100 numeric ECG samples.",
+    )
+    sample_rate = st.number_input(
+        "Sampling rate (Hz)", min_value=50, max_value=5000, value=360, step=1
+    )
+    if uploaded is None:
+        st.caption("No file is stored until you start an analysis.")
+        return
+    try:
+        frame = read_ecg_csv(uploaded.getvalue())
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    columns = list(frame.columns)
+    signal_column = st.selectbox(
+        "Signal column", columns, format_func=lambda column: str(column)
+    )
+    st.session_state["pending_upload"] = {
+        "name": uploaded.name,
+        "bytes": uploaded.getvalue(),
+        "frame": frame,
+        "column": signal_column,
+        "sample_rate": int(sample_rate),
+    }
+    st.success(f"Validated {uploaded.name}: {len(frame):,} rows.")
+    st.dataframe(frame.head(8), use_container_width=True, hide_index=True)
+    if st.button("Analyze ECG", type="primary", use_container_width=True):
+        with st.spinner("Processing ECG signal..."):
+            pending = st.session_state["pending_upload"]
+            values = pending["frame"][pending["column"]].to_numpy(dtype=float)
+            st.session_state["analysis"] = analyze_ecg(
+                values, int(pending["sample_rate"]), pending["name"]
+            )
+        st.session_state["pending_upload"] = None
+        st.session_state["page"] = "Results"
+        st.rerun()
+
+
+def show_analysis(result: dict[str, object]) -> None:
+    st.header("ECG visualization and analysis")
+    seconds = st.slider("Waveform window (seconds)", 2, 60, 10)
+    st.plotly_chart(waveform_figure(result, seconds), use_container_width=True)
+    statistics = result["statistics"]
+    cols = st.columns(5)
+    for column, label, value in zip(
+        cols,
+        ("Samples", "Duration", "Heart rate", "Detected beats", "Std. deviation"),
+        (
+            f"{statistics['samples']:,}",
+            f"{statistics['duration_seconds']:.2f} s",
+            f"{statistics['heart_rate_bpm']:.1f} BPM"
+            if statistics["heart_rate_bpm"] is not None
+            else "Unavailable",
+            f"{statistics['detected_beats']:,}",
+            f"{statistics['std']:.4f}",
+        ),
+    ):
+        column.metric(label, value)
+    status = str(result["prediction"])
+    style = "normal" if status == "Normal Heartbeat" else "abnormal"
+    st.markdown(
+        f'<div class="status-card {style}"><h2>{status}</h2>'
+        f"<p>Confidence: {float(result['confidence']):.1%}</p></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(str(result["explanation"]))
+
+
+def show_results(result: dict[str, object]) -> None:
+    st.header("Analysis results")
+    st.write(f"**File:** {result['file_name']}")
+    show_analysis(result)
+    pdf = create_pdf_report(result)
+    st.download_button(
+        "Download PDF report",
+        data=pdf,
+        file_name="ecg_analysis_report.pdf",
+        mime="application/pdf",
+        type="primary",
+    )
+    if st.button("Clear Results", use_container_width=True):
+        st.session_state.pop("analysis", None)
+        st.session_state.pop("pending_upload", None)
+        st.rerun()
+
+
+def main() -> None:
+    apply_styles()
+    if "page" not in st.session_state:
+        st.session_state["page"] = "Home"
+    with st.sidebar:
+        st.markdown("## ♥ Cloud ECG")
+        page = st.radio(
+            "Navigation", ["Home", "Upload ECG", "Analysis", "Results"],
+            index=["Home", "Upload ECG", "Analysis", "Results"].index(
+                st.session_state["page"]
+            ),
+        )
+        st.session_state["page"] = page
+        st.divider()
+        st.caption("Temporary processing • No accounts • No personal data storage")
+
+    if page == "Home":
+        show_home()
+    elif page == "Upload ECG":
+        show_upload()
+    elif page == "Analysis":
+        if "analysis" not in st.session_state:
+            st.info("Upload and analyze an ECG first.")
+        else:
+            show_analysis(st.session_state["analysis"])
+    else:
+        if "analysis" not in st.session_state:
+            st.info("Upload and analyze an ECG first.")
+        else:
+            show_results(st.session_state["analysis"])
+
+
+if __name__ == "__main__":
+    main()
