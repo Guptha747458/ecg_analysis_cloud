@@ -23,6 +23,12 @@ Upload `sample_ecg.csv`, use the default 360 Hz sampling rate, and select
 **Analyze ECG**. CSV files can have an optional header and one or more numeric
 columns. The sample rate must match the recording.
 
+The **MIT-BIH / WFDB** input mode accepts a matching `.hea` and `.dat` pair,
+plus an optional `.atr` annotation file. The first physical ECG channel is
+analyzed and annotation counts are shown for reference. WFDB files are
+created only inside a temporary directory while loading and are removed
+automatically afterward.
+
 ## Deploy on Streamlit Cloud
 
 1. Push this folder to a GitHub repository.

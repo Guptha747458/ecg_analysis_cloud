@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from io import BytesIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import wfdb
 from scipy.signal import butter, find_peaks, sosfiltfilt
 from sklearn.preprocessing import StandardScaler
 
@@ -30,6 +33,39 @@ def read_ecg_csv(data: bytes) -> pd.DataFrame:
     if numeric.empty:
         raise ValueError("The CSV does not contain usable numeric samples.")
     return numeric
+
+
+def read_wfdb_record(files: dict[str, bytes]) -> tuple[np.ndarray, int, str, int]:
+    """Read an uploaded MIT-BIH/WFDB record from temporary files."""
+    headers = [name for name in files if name.lower().endswith(".hea")]
+    if len(headers) != 1:
+        raise ValueError("Upload exactly one MIT-BIH .hea file.")
+    record_name = Path(headers[0]).stem
+    dat_name = f"{record_name}.dat"
+    if dat_name not in files:
+        raise ValueError(f"Upload the matching {dat_name} file.")
+    with TemporaryDirectory() as directory:
+        base = Path(directory) / record_name
+        for name, content in files.items():
+            if Path(name).stem == record_name and Path(name).suffix.lower() in {
+                ".hea", ".dat", ".atr"
+            }:
+                (Path(directory) / name).write_bytes(content)
+        try:
+            record = wfdb.rdrecord(str(base))
+        except (OSError, ValueError) as exc:
+            raise ValueError("The uploaded WFDB record could not be read.") from exc
+        if record.p_signal is None:
+            raise ValueError("The WFDB record has no physical ECG signal.")
+        signal = np.asarray(record.p_signal[:, 0], dtype=float)
+        annotations = 0
+        atr_name = f"{record_name}.atr"
+        if atr_name in files:
+            try:
+                annotations = len(wfdb.rdann(str(base), "atr").sample)
+            except (OSError, ValueError) as exc:
+                raise ValueError("The uploaded .atr annotation file is invalid.") from exc
+    return signal, int(record.fs), record_name, annotations
 
 
 def _filtered_signal(signal: np.ndarray, sample_rate: int) -> np.ndarray:

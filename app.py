@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from ecg_analysis import analyze_ecg, read_ecg_csv
+from ecg_analysis import analyze_ecg, read_ecg_csv, read_wfdb_record
 from pdf_report import create_pdf_report
 
 
@@ -117,18 +117,25 @@ def show_home() -> None:
     )
     st.subheader("CSV instructions")
     st.write(
-        "Use one numeric sample per row. A header is optional, and files may "
-        "contain multiple numeric columns; the signal column can be selected "
-        "after upload. The included sample_ecg.csv is ready to try."
+        "Use one numeric sample per row. You can also upload a complete "
+        "MIT-BIH/WFDB record (.hea + .dat, with optional .atr annotations)."
     )
 
 
 def show_upload() -> None:
     st.header("Upload ECG data")
+    format_choice = st.radio("Input format", ["CSV", "MIT-BIH / WFDB"], horizontal=True)
+    if format_choice == "CSV":
+        show_csv_upload()
+    else:
+        show_wfdb_upload()
+
+
+def show_csv_upload() -> None:
     uploaded = st.file_uploader(
-        "Choose an ECG CSV file",
-        type=["csv"],
+        "Choose an ECG CSV file", type=["csv"],
         help="CSV files must contain at least 100 numeric ECG samples.",
+        key="csv_upload",
     )
     sample_rate = st.number_input(
         "Sampling rate (Hz)", min_value=50, max_value=5000, value=360, step=1
@@ -160,6 +167,39 @@ def show_upload() -> None:
             values = pending["frame"][pending["column"]].to_numpy(dtype=float)
             st.session_state["analysis"] = analyze_ecg(
                 values, int(pending["sample_rate"]), pending["name"]
+            )
+        st.session_state["pending_upload"] = None
+        st.session_state["page"] = "Results"
+        st.rerun()
+
+
+def show_wfdb_upload() -> None:
+    uploaded_files = st.file_uploader(
+        "Choose MIT-BIH record files",
+        type=["hea", "dat", "atr"],
+        accept_multiple_files=True,
+        help="Upload one matching .hea and .dat pair. An .atr file is optional.",
+        key="wfdb_upload",
+    )
+    if not uploaded_files:
+        st.caption("WFDB files are written only to a temporary directory while loading.")
+        return
+    file_map = {Path(file.name).name: file.getvalue() for file in uploaded_files}
+    try:
+        signal, sample_rate, record_name, annotation_count = read_wfdb_record(file_map)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    st.success(f"Validated MIT-BIH record {record_name} at {sample_rate} Hz.")
+    columns = st.columns(3)
+    columns[0].metric("Samples", f"{len(signal):,}")
+    columns[1].metric("Channels", "1st ECG channel")
+    columns[2].metric("Annotations", f"{annotation_count:,}")
+    st.caption("The first physical ECG channel is analyzed. Reference annotations are informational.")
+    if st.button("Analyze MIT-BIH record", type="primary", use_container_width=True):
+        with st.spinner("Processing MIT-BIH ECG signal..."):
+            st.session_state["analysis"] = analyze_ecg(
+                signal, sample_rate, f"{record_name}.dat"
             )
         st.session_state["pending_upload"] = None
         st.session_state["page"] = "Results"
